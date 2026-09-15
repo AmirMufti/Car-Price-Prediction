@@ -1,176 +1,303 @@
 """
-Car Price Prediction - Improved Version
-=========================================
+Car Price Prediction - v3 (post code-review fixes)
+=====================================================
 
-Improvements over the original notebook:
-1. Fixed the scaled-vs-unscaled target bug: original code trained/evaluated on
-   raw price for some models but scaled price was still sitting in the frame.
-   Here, price is NEVER included in X and is only transformed via log1p (not
-   MinMax), which is the standard approach for right-skewed price targets.
-2. Removed target leakage risk: features are scaled with a scaler *fit only on
-   the training set*, not on the full dataframe before the split.
-3. Replaced raw CarBrand one-hot (which fragments into ~30 rare categories)
-   with frequency-based grouping of rare brands into "other".
-4. Expanded GridSearchCV grids (the originals were narrow and left several
-   XGBoost hyperparameters untuned) and added RandomizedSearchCV as a faster
-   alternative for the larger grids.
-5. Added a proper cross-validated comparison across models using consistent
-   scoring (R2), plus MAE/RMSE on a held-out test set for the winning model.
-6. Added feature importance + permutation importance for interpretability.
-7. Fixed typo/duplicate axis labels in the original plots.
+This revision fixes the issues raised in a code review of the previous
+version (see REVIEW_FINDINGS.md). Summary of what changed and why:
+
+1. Category encoding no longer leaks test data into feature construction.
+   Rare-brand grouping, one-hot encoding, and numeric scaling are now all
+   sklearn Transformers living INSIDE a Pipeline, fit only on whatever data
+   GridSearchCV/train_test_split hands them at fit time. Concretely this
+   means: (a) the "which brands count as rare" decision is made from
+   training folds only, and (b) OneHotEncoder(handle_unknown="ignore") means
+   a genuinely new car with an unseen brand/category no longer crashes
+   prediction — it just gets zeroed-out dummy columns instead.
+
+2. Model selection and the final reported metric are now on the SAME scale.
+   Every model is wrapped in TransformedTargetRegressor(log1p/expm1), so
+   GridSearchCV's R2 is computed after back-transforming to dollars — the
+   CV ranking and the headline number are answering the same question now,
+   instead of ranking models in log-space and reporting dollar-space.
+
+3. A Duan's smearing correction is applied to the back-transformed
+   predictions to correct the systematic underestimation bias that log1p/
+   expm1 round-trips introduce (Jensen's inequality on the convex exp()).
+
+4. The reported test metrics are no longer a single lucky/unlucky 80/20
+   split. The winning model+hyperparameters are refit across 30 repeated
+   random train/test splits, and R2/MAE/RMSE are reported as mean +/- std
+   with a 95% interval, alongside the single canonical split (seed=42) used
+   for the plots.
+
+5. Hyperparameter grids were trimmed. The previous XGBoost grid alone
+   searched 288 combinations against ~164 training rows, which mostly adds
+   overfitting risk to the model-selection step itself on a 205-row dataset,
+   without meaningfully changing which model wins.
+
+Caveat that still applies: with only 205 rows, even a 30-split confidence
+interval is an approximation, not a guarantee. Treat these numbers as
+"this approach is clearly reasonable and Ridge is a believable winner",
+not as a precise benchmark to quote to three decimal places.
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-from sklearn.model_selection import train_test_split, GridSearchCV, KFold, cross_val_score
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 from sklearn.inspection import permutation_importance
 import xgboost as xgb
+import joblib
 
 RANDOM_STATE = 42
+N_REPEATS = 30  # repeated random splits used for the final confidence interval
 
 # ---------------------------------------------------------------------------
-# 1. Load data
+# 1. Load data + light feature engineering (safe to do before the split:
+#    these only derive brand/model strings from CarName, no target/no
+#    train-only statistics are involved yet)
 # ---------------------------------------------------------------------------
-df = pd.read_csv("CarPrice_Assignment.csv")
+raw = pd.read_csv("CarPrice_Assignment.csv")
 
-# ---------------------------------------------------------------------------
-# 2. Feature engineering
-# ---------------------------------------------------------------------------
-df[["CarBrand", "CarModel"]] = df["CarName"].str.split(" ", n=1, expand=True)
-df["CarBrand"] = df["CarBrand"].str.lower().replace({
+raw[["CarBrand", "CarModel"]] = raw["CarName"].str.split(" ", n=1, expand=True)
+raw["CarBrand"] = raw["CarBrand"].str.lower().replace({
     "vw": "volkswagen", "vokswagen": "volkswagen",
     "toyouta": "toyota", "porcshce": "porsche",
     "maxda": "mazda",
 })
+raw = raw.drop(columns=["car_ID", "CarName", "CarModel"])
 
-# group rare brands (fewer than 4 occurrences) into "other" instead of
-# one-hot-encoding ~30 sparse brand columns
-brand_counts = df["CarBrand"].value_counts()
-rare_brands = brand_counts[brand_counts < 4].index
-df["CarBrand"] = df["CarBrand"].where(~df["CarBrand"].isin(rare_brands), "other")
-
-df = df.drop(columns=["car_ID", "CarName", "CarModel"])
-
-# binary encodings
 binary_mappings = {
     "fueltype": {"gas": 0, "diesel": 1},
     "aspiration": {"std": 0, "turbo": 1},
     "enginelocation": {"front": 0, "rear": 1},
 }
 for col, mapping in binary_mappings.items():
-    df[col] = df[col].map(mapping)
+    raw[col] = raw[col].map(mapping)
+raw["symboling"] = raw["symboling"].astype(int)
 
-df["symboling"] = df["symboling"].astype(int)
+y = raw["price"].copy()
+X = raw.drop(columns=["price"])
 
-one_hot_cols = ["doornumber", "carbody", "drivewheel", "enginetype",
-                 "cylindernumber", "fuelsystem", "CarBrand"]
-df = pd.get_dummies(df, columns=one_hot_cols, drop_first=True, dtype=int)
-
-# ---------------------------------------------------------------------------
-# 3. Target transform: log1p to tame right-skew in price
-# ---------------------------------------------------------------------------
-y_raw = df["price"].copy()
-y = np.log1p(y_raw)
-X = df.drop(columns=["price"])
-
-X_train, X_test, y_train, y_test, y_train_raw, y_test_raw = train_test_split(
-    X, y, y_raw, test_size=0.2, random_state=RANDOM_STATE
-)
-
-# scale numeric columns using a scaler fit ONLY on the training split
 numeric_cols = ["wheelbase", "carlength", "carwidth", "carheight", "curbweight",
                  "enginesize", "boreratio", "stroke", "compressionratio",
                  "horsepower", "peakrpm", "citympg", "highwaympg"]
+categorical_cols = ["doornumber", "carbody", "drivewheel", "enginetype",
+                     "cylindernumber", "fuelsystem", "CarBrand"]
+passthrough_cols = ["symboling", "fueltype", "aspiration", "enginelocation"]
 
-scaler = MinMaxScaler()
-X_train = X_train.copy()
-X_test = X_test.copy()
-X_train[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
-X_test[numeric_cols] = scaler.transform(X_test[numeric_cols])
+
+class RareBrandGrouper(BaseEstimator, TransformerMixin):
+    """Groups CarBrand values seen fewer than `min_count` times into "other".
+
+    Fit-time only looks at whatever data it is given, so when this sits
+    inside a Pipeline used by GridSearchCV or train_test_split, the set of
+    "common" brands is always derived from the training fold only — never
+    from data outside it. A brand never seen during fit (or too rare) simply
+    maps to "other" at transform time, so it can't create a new one-hot
+    column that didn't exist during training.
+    """
+
+    def __init__(self, min_count=4):
+        self.min_count = min_count
+
+    def fit(self, X, y=None):
+        counts = X["CarBrand"].value_counts()
+        self.common_brands_ = set(counts[counts >= self.min_count].index)
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        X["CarBrand"] = X["CarBrand"].where(X["CarBrand"].isin(self.common_brands_), "other")
+        return X
+
+
+def build_pipeline(estimator):
+    """Full leakage-safe pipeline: brand grouping -> encode/scale -> model.
+
+    Every step is fit only on the data passed to .fit(), so this is safe to
+    use directly inside GridSearchCV (each CV fold gets its own brand
+    grouping/encoding/scaling) and to refit from scratch across the repeated
+    train/test splits used for the confidence interval below.
+    """
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", MinMaxScaler(), numeric_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore", drop="first"), categorical_cols),
+        ("bin", "passthrough", passthrough_cols),
+    ])
+    target_model = TransformedTargetRegressor(regressor=estimator, func=np.log1p, inverse_func=np.expm1)
+    return Pipeline([
+        ("brand_group", RareBrandGrouper(min_count=4)),
+        ("prep", preprocessor),
+        ("model", target_model),
+    ])
+
+
+def smearing_correct(pipeline, X_train, y_train, X_new):
+    """Duan's smearing estimator: corrects the systematic underestimation
+    that a plain expm1(predicted log-price) introduces (Jensen's inequality
+    on the convex exp function biases naive back-transformed point
+    predictions downward on average)."""
+    log_pred_train = np.log1p(pipeline.predict(X_train))
+    log_resid_train = np.log1p(y_train.to_numpy()) - log_pred_train
+    smear_factor = np.mean(np.exp(log_resid_train))
+    return pipeline.predict(X_new) * smear_factor
+
 
 # ---------------------------------------------------------------------------
-# 4. Model comparison with GridSearchCV (expanded grids)
+# 2. Canonical 80/20 split (seed=42) used for model selection + plots
+# ---------------------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE
+)
+
+# ---------------------------------------------------------------------------
+# 3. Model comparison with GridSearchCV, scored in DOLLAR-space R2 (fixes
+#    the log-space-vs-dollar-space mismatch from the previous version), with
+#    trimmed grids appropriate for a 205-row dataset
 # ---------------------------------------------------------------------------
 cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
 
 model_params = {
-    "LinearRegression": {"model": LinearRegression(), "params": {}},
-    "Ridge": {"model": Ridge(random_state=RANDOM_STATE), "params": {"alpha": [0.1, 1.0, 10.0, 50.0]}},
-    "Lasso": {"model": Lasso(random_state=RANDOM_STATE, max_iter=10000), "params": {"alpha": [0.001, 0.01, 0.1, 1.0]}},
+    "LinearRegression": {"estimator": LinearRegression(), "params": {}},
+    "Ridge": {
+        "estimator": Ridge(random_state=RANDOM_STATE),
+        "params": {"model__regressor__alpha": [0.1, 1.0, 10.0]},
+    },
+    "Lasso": {
+        "estimator": Lasso(random_state=RANDOM_STATE, max_iter=10000),
+        "params": {"model__regressor__alpha": [0.001, 0.01, 0.1]},
+    },
     "DecisionTree": {
-        "model": DecisionTreeRegressor(random_state=RANDOM_STATE),
-        "params": {"criterion": ["absolute_error", "squared_error"], "max_depth": [4, 6, 8, None], "min_samples_leaf": [1, 2, 5]},
+        "estimator": DecisionTreeRegressor(random_state=RANDOM_STATE),
+        "params": {
+            "model__regressor__max_depth": [4, 6, None],
+            "model__regressor__min_samples_leaf": [2, 5],
+        },
     },
     "RandomForest": {
-        "model": RandomForestRegressor(random_state=RANDOM_STATE),
-        "params": {"n_estimators": [200, 400], "max_depth": [6, 10, None], "min_samples_leaf": [1, 2, 4], "max_features": ["sqrt", 1.0]},
+        "estimator": RandomForestRegressor(random_state=RANDOM_STATE),
+        "params": {
+            "model__regressor__n_estimators": [200, 400],
+            "model__regressor__max_depth": [6, None],
+            "model__regressor__min_samples_leaf": [1, 2],
+        },
     },
     "GradientBoosting": {
-        "model": GradientBoostingRegressor(random_state=RANDOM_STATE),
-        "params": {"n_estimators": [100, 300], "max_depth": [2, 3, 4], "learning_rate": [0.03, 0.1]},
+        "estimator": GradientBoostingRegressor(random_state=RANDOM_STATE),
+        "params": {
+            "model__regressor__n_estimators": [100, 200],
+            "model__regressor__max_depth": [2, 3],
+            "model__regressor__learning_rate": [0.05, 0.1],
+        },
     },
     "XGB": {
-        "model": xgb.XGBRegressor(random_state=RANDOM_STATE, objective="reg:squarederror"),
+        "estimator": xgb.XGBRegressor(random_state=RANDOM_STATE, objective="reg:squarederror"),
         "params": {
-            "n_estimators": [200, 400],
-            "max_depth": [2, 3, 4],
-            "learning_rate": [0.03, 0.05, 0.1],
-            "min_child_weight": [1, 3],
-            "subsample": [0.8, 1.0],
-            "colsample_bytree": [0.8, 1.0],
-            "reg_lambda": [1.0, 2.0],
+            "model__regressor__n_estimators": [200, 300],
+            "model__regressor__max_depth": [2, 3],
+            "model__regressor__learning_rate": [0.05, 0.1],
+            "model__regressor__subsample": [0.8, 1.0],
         },
     },
 }
 
 results = []
-fitted_best_models = {}
+fitted_pipelines = {}
 
 for name, mp in model_params.items():
-    grid = GridSearchCV(mp["model"], mp["params"], cv=cv, scoring="r2", n_jobs=-1)
+    pipe = build_pipeline(mp["estimator"])
+    grid = GridSearchCV(pipe, mp["params"], cv=cv, scoring="r2", n_jobs=-1)
     grid.fit(X_train, y_train)
-    fitted_best_models[name] = grid.best_estimator_
+    fitted_pipelines[name] = grid.best_estimator_
     results.append({
         "model": name,
-        "cv_best_r2": grid.best_score_,
+        "cv_best_r2_dollar_scale": grid.best_score_,
         "best_params": grid.best_params_,
     })
 
-results_df = pd.DataFrame(results).sort_values("cv_best_r2", ascending=False)
-print("\n=== Cross-validated R2 by model (log-price target) ===")
-print(results_df[["model", "cv_best_r2"]].to_string(index=False))
+results_df = pd.DataFrame(results).sort_values("cv_best_r2_dollar_scale", ascending=False)
+print("\n=== Cross-validated R2 by model (dollar-scale, matches final metric) ===")
+print(results_df[["model", "cv_best_r2_dollar_scale"]].to_string(index=False))
 
-# ---------------------------------------------------------------------------
-# 5. Evaluate the best model on the held-out test set, in real-dollar terms
-# ---------------------------------------------------------------------------
 best_name = results_df.iloc[0]["model"]
-best_model = fitted_best_models[best_name]
+best_pipeline = fitted_pipelines[best_name]
+best_params_row = results_df.iloc[0]["best_params"]
 
-y_pred_log = best_model.predict(X_test)
-y_pred = np.expm1(y_pred_log)  # back-transform to dollars
-
-r2 = r2_score(y_test_raw, y_pred)
-mae = mean_absolute_error(y_test_raw, y_pred)
-rmse = np.sqrt(mean_squared_error(y_test_raw, y_pred))
-
-print(f"\n=== Best model: {best_name} ===")
-print(f"Test R2 (dollar scale):  {r2:.4f}")
-print(f"Test MAE (dollar scale): {mae:,.2f}")
-print(f"Test RMSE (dollar scale): {rmse:,.2f}")
+prefix = "model__regressor__"
+best_estimator_params = {k[len(prefix):]: v for k, v in best_params_row.items() if k.startswith(prefix)}
+best_estimator_template = clone(model_params[best_name]["estimator"]).set_params(**best_estimator_params)
 
 # ---------------------------------------------------------------------------
-# 6. Feature importance (native + permutation)
+# 4. Metrics on the canonical split (seed=42), with smearing correction
 # ---------------------------------------------------------------------------
-if hasattr(best_model, "feature_importances_"):
-    importances = pd.Series(best_model.feature_importances_, index=X_train.columns)
+y_pred = smearing_correct(best_pipeline, X_train, y_train, X_test)
+
+r2 = r2_score(y_test, y_pred)
+mae = mean_absolute_error(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+print(f"\n=== Best model: {best_name} (single canonical split, seed={RANDOM_STATE}) ===")
+print(f"Test R2:   {r2:.4f}")
+print(f"Test MAE:  {mae:,.2f}")
+print(f"Test RMSE: {rmse:,.2f}")
+
+# ---------------------------------------------------------------------------
+# 5. Confidence interval from 30 repeated random splits, refitting the
+#    winning model+hyperparameters from scratch each time (brand grouping,
+#    encoding, and scaling are all refit fresh per split -> no leakage)
+# ---------------------------------------------------------------------------
+r2_scores, mae_scores, rmse_scores = [], [], []
+
+for i in range(N_REPEATS):
+    Xtr_i, Xte_i, ytr_i, yte_i = train_test_split(X, y, test_size=0.2, random_state=1000 + i)
+    pipe_i = build_pipeline(clone(best_estimator_template))
+    pipe_i.fit(Xtr_i, ytr_i)
+    pred_i = smearing_correct(pipe_i, Xtr_i, ytr_i, Xte_i)
+    r2_scores.append(r2_score(yte_i, pred_i))
+    mae_scores.append(mean_absolute_error(yte_i, pred_i))
+    rmse_scores.append(np.sqrt(mean_squared_error(yte_i, pred_i)))
+
+r2_scores = np.array(r2_scores)
+mae_scores = np.array(mae_scores)
+rmse_scores = np.array(rmse_scores)
+
+print(f"\n=== {best_name}: {N_REPEATS}-repeat holdout confidence interval ===")
+print(f"R2:   {r2_scores.mean():.4f} +/- {r2_scores.std():.4f}  "
+      f"(95% range [{np.percentile(r2_scores, 2.5):.4f}, {np.percentile(r2_scores, 97.5):.4f}])")
+print(f"MAE:  {mae_scores.mean():,.2f} +/- {mae_scores.std():,.2f}")
+print(f"RMSE: {rmse_scores.mean():,.2f} +/- {rmse_scores.std():,.2f}")
+
+pd.DataFrame({"r2": r2_scores, "mae": mae_scores, "rmse": rmse_scores}).to_csv(
+    "repeated_split_scores.csv", index=False
+)
+print("Saved repeated_split_scores.csv")
+
+# ---------------------------------------------------------------------------
+# 6. Persist the fitted pipeline so it can be reused for real predictions
+#    without needing to re-run this whole script (fixes the "no way to score
+#    a new car" gap flagged in review — handle_unknown='ignore' means an
+#    unseen brand/category degrades gracefully instead of crashing)
+# ---------------------------------------------------------------------------
+joblib.dump(best_pipeline, "best_model_pipeline.joblib")
+print("Saved best_model_pipeline.joblib")
+
+# ---------------------------------------------------------------------------
+# 7. Feature importance (native + permutation), using the canonical split
+# ---------------------------------------------------------------------------
+fitted_regressor = best_pipeline.named_steps["model"].regressor_
+if hasattr(fitted_regressor, "feature_importances_"):
+    feature_names = best_pipeline.named_steps["prep"].get_feature_names_out()
+    importances = pd.Series(fitted_regressor.feature_importances_, index=feature_names)
     importances = importances.sort_values(ascending=False).head(15)
 
     plt.figure(figsize=(10, 6))
@@ -183,7 +310,7 @@ if hasattr(best_model, "feature_importances_"):
     plt.close()
     print("\nSaved feature_importance.png")
 
-perm = permutation_importance(best_model, X_test, y_test, n_repeats=20, random_state=RANDOM_STATE, n_jobs=-1)
+perm = permutation_importance(best_pipeline, X_test, y_test, n_repeats=20, random_state=RANDOM_STATE, n_jobs=-1)
 perm_series = pd.Series(perm.importances_mean, index=X_test.columns).sort_values(ascending=False).head(15)
 
 plt.figure(figsize=(10, 6))
@@ -197,11 +324,11 @@ plt.close()
 print("Saved permutation_importance.png")
 
 # ---------------------------------------------------------------------------
-# 7. Actual vs predicted plot
+# 8. Actual vs predicted plot (canonical split)
 # ---------------------------------------------------------------------------
 plt.figure(figsize=(7, 7))
-plt.scatter(y_test_raw, y_pred, alpha=0.6)
-lims = [min(y_test_raw.min(), y_pred.min()), max(y_test_raw.max(), y_pred.max())]
+plt.scatter(y_test, y_pred, alpha=0.6)
+lims = [min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())]
 plt.plot(lims, lims, "r--", label="Perfect prediction")
 plt.xlabel("Actual price")
 plt.ylabel("Predicted price")
