@@ -5,11 +5,10 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
-%matplotlib inline
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler, LabelEncoder
 
 # loading the dataset
-df = pd.read_csv(r'C:\Users\Mr Amir Mufti\Downloads\CarPrice_Assignment.csv')
+df = pd.read_csv('CarPrice_Assignment.csv')
 
 # viewing the dataframe
 pd.set_option('display.max_columns', None)
